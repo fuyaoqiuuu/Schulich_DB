@@ -54,12 +54,14 @@ SELECT -- Select each ticket and count how many distinct articles were purchased
     COUNT(DISTINCT article) AS number_of_unique_items
 FROM assignment01.bakery_sales
 -- Filter rows to only include sales from December 2021.
+-- WHERE TO_CHAR(sale_date, 'YYYY-MM') = '2021-12'
 WHERE sale_date >= DATE '2021-12-01'
   AND sale_date < DATE '2022-01-01'
 -- Group rows by ticket so the count is calculated per ticket.
 GROUP BY ticket_number
 -- Keep only tickets with 5 or more unique items.
-HAVING COUNT(DISTINCT article) >= 5;
+HAVING COUNT(DISTINCT article) >= 5
+ORDER BY number_of_unique_items DESC;
 
 
 -- Q3: Most Popular Hour for Traditional Baguette Sales (2 points)
@@ -71,13 +73,13 @@ HAVING COUNT(DISTINCT article) >= 5;
 -- ✅ Bonus: You can break ties by selecting the earliest hour of the day in case of equal sales.
 
 SELECT -- Find the hour of day when Traditional Baguette sales were highest in July.
-    EXTRACT(HOUR FROM sale_time) AS sale_hour,
+    DATE_PART('hour', sale_time) AS sale_hour,
     SUM(quantity) AS total_quantity_sold
 FROM assignment01.bakery_sales
 -- Keep only rows for Traditional Baguette.
 WHERE article = 'TRADITIONAL BAGUETTE'
   -- Keep only sales that occurred in July, across all years.
-  AND EXTRACT(MONTH FROM sale_date) = 7
+  AND DATE_PART('month', sale_date) = 7
 -- Aggregate sales by hour of day.
 GROUP BY 1
 -- Show the hour with the highest total quantity sold first.
@@ -159,8 +161,8 @@ FROM two_hour_windows
 ORDER BY total_quantity_sold DESC,
          total_revenue DESC,
          start_hour
+LIMIT 1;
 -- Return only the top window.
-LIMIT 3;
 
 
 
@@ -232,14 +234,26 @@ ORDER BY article;
 -- 3) Negative or zero quantities. Found out there are no 0 quantity, but 1,295 records with negative quantities
 SELECT *
 FROM assignment01.bakery_sales
-WHERE quantity <= 0
-ORDER BY quantity;
+WHERE quantity < 0
+ORDER BY ticket_number;
+
+-- 3) continued. investigate into this 200 qty sales
+SELECT *
+FROM assignment01.bakery_sales
+WHERE ticket_number BETWEEN '179925' AND '179935'
+ORDER BY ticket_number;
 
 -- 4) Negative or zero prices. Found out 27 records with 0 prices
 SELECT *
 FROM assignment01.bakery_sales
 WHERE unit_price <= 0
 ORDER BY unit_price, ticket_number;
+
+--
+SELECT *
+FROM assignment01.bakery_sales
+WHERE article = '150079'
+ORDER BY ticket_number;
 
 
 -- 5) Outliers in Quantity
@@ -280,7 +294,7 @@ GROUP BY bucket
 ORDER BY bucket;
 
 
--- 7) Unusually high unit prices
+-- 6) Unusually high unit prices
 SELECT
     unit_price,
     COUNT(*) AS record_count
@@ -323,9 +337,24 @@ WHERE b.unit_price IS NOT NULL
 GROUP BY bucket
 ORDER BY bucket;
 
+-- Investigated into $35 price bucket to check validity
+SELECT *
+FROM assignment01.bakery_sales
+WHERE unit_price >= 35
+ORDER BY ticket_number;
+
+-- 7) Check for Invalid date & time
+SELECT
+    COUNT(*) AS not_aligned
+FROM assignment01.bakery_sales
+WHERE (sale_date::TIMESTAMP + sale_time::TIME) <> sale_datetime;
+-- the sale_date and sale_time columns seem to be aligned with the sale_datetime
+-- During the exercises, I did not notice other issues or outliers with the date and time
+
+
 
 ---------------------------------------------------------------------------------------------------------------------------
--- EXPLORATION
+-- EXPLORATION OUT OF SELF INTEREST
 -- 1) Total revenue by year-month
 -- Very seasonal business, with Jul-Aug to be busiest months
 SELECT
@@ -373,6 +402,7 @@ ORDER BY --sorts by highest ticket revenue first, then ticket, then item details
     bs.ticket_number,
     bs.sale_datetime,
     bs.article;
+
 
 -- SO WEIRD... the LOD for some transaction
 SELECT
