@@ -1,4 +1,4 @@
--- TWO ASSUMPTIONS/VALIDATION ABOUT THE DATASETS BEFORE THE OFFICIAL QUERY
+-- Validating 2 assumptions about the granularity of the data of the orders_dataset before the official query
 
 -- EVERY ORDER ONLY HAS 1 PRODUCT
 SELECT
@@ -27,7 +27,7 @@ HAVING
 CREATE SCHEMA IF NOT EXISTS customer360;
 
 -- 1. Create the structured table under your schema
-CREATE TABLE IF NOT EXISTS customer360.output_table (
+CREATE TABLE IF NOT EXISTS customer360.full_360_view (
     customer_id INT,
     first_name VARCHAR(255),
     last_name VARCHAR(255),
@@ -53,10 +53,10 @@ CREATE TABLE IF NOT EXISTS customer360.output_table (
 
 
 -- 2. Completely wipe all existing data out of the original table
-TRUNCATE TABLE customer360.output_table;
+TRUNCATE TABLE customer360.full_360_view;
 
--- 3. Insert query results into it
---CTE 1: Static Customer/Conversion Data as bass
+-- 3. Insert customer360 query results into the output table
+--CTE 1: Static Customer/Conversion Data as base for the spine generation
 WITH conversion_base AS (
     select cd.customer_id,
            cd.first_name,
@@ -72,7 +72,7 @@ WITH conversion_base AS (
            cs.conversion_channel,
            cs.order_number
     from fact_tables.conversions as cs
-    RIGHT JOIN dimensions.customer_dimension as cd
+    RIGHT JOIN dimensions.customer_dimension as cd -- this is to ensure we keep all customers even if they have no conversions 
         ON cs.fk_customer = cd.sk_customer
     LEFT JOIN dimensions.date_dimension AS dd
         ON cs.fk_conversion_date = dd.sk_date
@@ -82,7 +82,7 @@ WITH conversion_base AS (
 first_orders AS (
     SELECT cb.conversion_id,
            cb.order_number,
--- no need to aggregate by conversion_id? i.e. 1 conversion to 1 order to 1 product?
+-- confirmed no need to aggregate by conversion_id i.e. 1 conversion to 1 order to 1 product
             dd.year_week AS first_order_week,
             o.price_paid AS first_order_total_paid
     FROM conversion_base AS cb
@@ -115,7 +115,7 @@ weekly_spine AS (
             dd.year_week                                                         AS order_week,
             -- Generate a sequence counter starting from 1 for each conversion period
             ROW_NUMBER() OVER (PARTITION BY conversion_id ORDER BY dd.year_week) AS week_counter,
-            ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY dd.year_week)   AS lifetime_week_counter
+            ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY dd.year_week)   AS lifetime_week_counter -- not used in final output but was used to validate the spine generation    
      FROM conversion_base AS cb
               LEFT JOIN (SELECT DISTINCT year_week FROM dimensions.date_dimension) AS dd
                         ON dd.year_week >= cb.conversion_week
@@ -139,18 +139,18 @@ final_table AS (
         fo.first_order_total_paid,
         ws.week_counter,
         ws.order_week,
-        CASE WHEN  awo.orders_count > 0 THEN 1 ELSE 0 END AS orders_placed,
-        COALESCE(awo.total_before_discounts, 0) AS total_before_discounts,
-        COALESCE(awo.total_discounts, 0) AS total_discounts,
-        COALESCE(awo.total_paid_in_week, 0) AS total_paid_in_week,
+        CASE WHEN awo.orders_count > 0 THEN 1 ELSE 0 END AS orders_placed,
+        CASE WHEN awo.total_before_discounts IS NULL THEN 0 ELSE awo.total_before_discounts END AS total_before_discounts,
+        CASE WHEN awo.total_discounts IS NULL THEN 0 ELSE awo.total_discounts END AS total_discounts,
+        CASE WHEN awo.total_paid_in_week IS NULL THEN 0 ELSE awo.total_paid_in_week END AS total_paid_in_week,
 
     -- Cumulative fields calculated using window functions over the generated spine
-        SUM(COALESCE(awo.total_paid_in_week,0)) OVER(
+        SUM(awo.total_paid_in_week) OVER(
             PARTITION BY ws.conversion_id
             ORDER BY ws.order_week
             ) AS conversion_cumulative_revenue,
 
-        SUM(COALESCE(awo.total_paid_in_week,0)) OVER (
+        SUM(awo.total_paid_in_week) OVER (
             PARTITION BY ws.customer_id
             ORDER BY WS.order_week
             ) AS lifetime_cumulative_revenue
@@ -163,7 +163,7 @@ final_table AS (
         -- WHERE ws.customer_id = 333
     ORDER BY ws.customer_id, ws.conversion_id, ws.week_counter
     )
-INSERT INTO customer360.output_table
+INSERT INTO customer360.full_360_view
 SELECT * FROM final_table;
 
 
