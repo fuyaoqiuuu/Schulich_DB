@@ -122,8 +122,8 @@ WITH conversion_base AS (
         ON cs.fk_conversion_date = dd.sk_date
     ),
 
--- CTE 2: Order placed per conversion and week
-conversion_orders AS (
+-- CTE 2: Order_week per conversion
+order_week_details AS (
     SELECT cb.conversion_id,
            -- Confirmed no need to aggregate by conversion_id i.e. 1 conversion to 1 order to 1 product
            cb.order_number,
@@ -179,8 +179,8 @@ final_table AS (
         ws.conversion_week,
         next_conversion_week,
         ws.conversion_channel,
-        co.order_week AS first_order_week,
-        co.order_total_paid AS first_order_total_paid,
+        owd.order_week AS first_order_week,
+        owd.order_total_paid AS first_order_total_paid,
         ws.week_counter,
         ws.order_week,
         CASE WHEN awo.orders_count > 0 THEN 1 ELSE 0 END AS orders_placed,
@@ -193,8 +193,8 @@ final_table AS (
         SUM(CASE WHEN awo.total_paid_in_week IS NULL THEN 0 ELSE awo.total_paid_in_week END) OVER (PARTITION BY ws.customer_id ORDER BY WS.order_week) AS lifetime_cumulative_revenue
 
     FROM weekly_spine AS ws
-    LEFT JOIN conversion_orders AS co
-        ON ws.conversion_id = co.conversion_id
+    LEFT JOIN order_week_details AS owd
+        ON ws.conversion_id = owd.conversion_id
     LEFT JOIN aggregated_weekly_order AS awo
         ON ws.customer_id = awo.customer_id AND ws.order_week = awo.order_week
         -- WHERE ws.customer_id = 333
@@ -202,3 +202,15 @@ final_table AS (
     )
 INSERT INTO customer360.full_360_view
 SELECT * FROM final_table;
+
+
+
+------------------------------------------------------------------------------------------------------------------------------
+-- Cross validation of final results across each group members' codes
+SELECT
+    customer_id,
+    COUNT(*) AS row_count,
+    MAX(lifetime_cumulative_revenue) AS lifetime_cumulative_revenue
+FROM customer360.full_360_view
+GROUP BY customer_id
+ORDER BY customer_id;
