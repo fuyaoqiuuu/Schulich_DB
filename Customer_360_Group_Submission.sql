@@ -1,32 +1,79 @@
--- Validating 2 assumptions about the granularity of the data of the orders_dataset before the official query
+-- Validating assumptions about the granularity of the data of the orders_dataset before the official query
 
--- EVERY ORDER ONLY HAS 1 PRODUCT
-SELECT
-    order_number,
-    COUNT(DISTINCT fk_product) AS unique_products_count
-FROM
-    fact_tables.orders
-GROUP BY
-    order_number
-HAVING
-    COUNT(DISTINCT fk_product) > 0;
+-- ASSUMPTION 1: EVERY ORDER ONLY HAS 1 PRODUCT
+-- If this returns no rows, each order maps to exactly one product
+SELECT order_number,
+       COUNT(DISTINCT fk_product) AS unique_products_count
+FROM fact_tables.orders
+GROUP BY order_number
+HAVING COUNT(DISTINCT fk_product) > 1;
 
--- EVERY ORDER_ID ONLY HAS 1 order_number
-SELECT
-    order_id,
-    COUNT(DISTINCT order_number) AS unique_order_number_count
-FROM
-    fact_tables.orders
-GROUP BY
-    order_id,order_number
-HAVING
-    COUNT(DISTINCT order_number) > 1;
+-- ASSUMPTION 2: EVERY ORDER_ID ONLY HAS 1 order_number
+-- If this returns no rows, each order_id maps to exactly one order_number
+SELECT order_id,
+       COUNT(DISTINCT order_number) AS unique_order_number_count
+FROM fact_tables.orders
+GROUP BY order_id,order_number
+HAVING COUNT(DISTINCT order_number) > 1;
+
+
+-- ASSUMPTION 3: EVERY CONVERSION ONLY HAS 1 ORDER NUMBER
+-- If this returns no rows, each conversion maps to exactly one order
+SELECT conversion_id,
+       COUNT(DISTINCT order_number) AS unique_orders
+FROM fact_tables.conversions
+GROUP BY conversion_id
+HAVING COUNT(DISTINCT order_number) > 1;
+
+
+-- ASSUMPTION 4: EVERY ORDER NUMBER IN CONVERSIONS EXISTS IN THE ORDERS TABLE
+-- If this returns no rows, there are no orphaned order references in conversions
+SELECT c.conversion_id,
+       c.order_number
+FROM fact_tables.conversions AS c
+LEFT JOIN fact_tables.orders AS o
+    ON c.order_number = o.order_number
+WHERE o.order_number IS NULL;
+
+
+-- ASSUMPTION 5: FIRST ORDER WEEK = FIRST CONVERSION WEEK FOR EACH CUSTOMER
+-- If this returns no rows, every customer's first order happened in the same week as their first conversion
+WITH first_conversions AS (
+    SELECT cs.fk_customer,
+           MIN(dd.year_week) AS first_conversion_week
+    FROM fact_tables.conversions AS cs
+    LEFT JOIN dimensions.date_dimension AS dd
+        ON cs.fk_conversion_date = dd.sk_date
+    GROUP BY cs.fk_customer
+),
+first_orders AS (
+    SELECT cs.fk_customer,
+           MIN(dd.year_week) AS first_order_week
+    FROM fact_tables.conversions AS cs
+    LEFT JOIN fact_tables.orders AS o
+        ON cs.order_number = o.order_number
+    LEFT JOIN dimensions.date_dimension AS dd
+        ON o.fk_order_date = dd.sk_date
+    GROUP BY cs.fk_customer
+)
+SELECT fc.fk_customer,
+       fc.first_conversion_week,
+       fo.first_order_week
+FROM first_conversions AS fc
+LEFT JOIN first_orders AS fo
+    ON fc.fk_customer = fo.fk_customer
+WHERE fc.first_conversion_week != fo.first_order_week
+   OR fo.first_order_week IS NULL;
+
 
 
 ----------------------------------------------------------------------------------------------------------------
 CREATE SCHEMA IF NOT EXISTS customer360;
 
--- 1. Create the structured table under your schema
+-- 1. Start over with a clean slate and drop a previous table if it exists
+DROP TABLE IF EXISTS customer360.full_360_view;
+
+-- 2. Create the structured table under the schema
 CREATE TABLE IF NOT EXISTS customer360.full_360_view (
     customer_id INT,
     first_name VARCHAR(255),
@@ -51,40 +98,37 @@ CREATE TABLE IF NOT EXISTS customer360.full_360_view (
 );
 
 
-
--- 2. Completely wipe all existing data out of the original table
-TRUNCATE TABLE customer360.full_360_view;
-
 -- 3. Insert customer360 query results into the output table
+
 --CTE 1: Static Customer/Conversion Data as base for the spine generation
 WITH conversion_base AS (
-    select cd.customer_id,
+    SELECT cd.customer_id,
            cd.first_name,
            cd.last_name,
            cs.conversion_id,
-           -- window functions to sequence the orders of each conversion
-           row_number() over (partition by cd.customer_id order by cs.conversion_date ASC) as conversion_numer,
+           -- We use window functions to sequence the orders of each conversion
+           ROW_NUMBER() OVER (PARTITION BY cd.customer_id ORDER BY cs.conversion_date ASC) AS conversion_number,
            cs.conversion_type,
            cs.conversion_date,
-           dd.year_week as conversion_week,
-           -- Use window functions to find the next conversion week
-           lead(dd.year_week,1,null) over (partition by cd.customer_id order by cs.conversion_date) as next_conversion_week,
+           dd.year_week AS conversion_week,
+           -- We use window functions to find the next conversion week
+           LEAD(dd.year_week,1,NULL) OVER (PARTITION BY cd.customer_id ORDER BY cs.conversion_date) AS next_conversion_week,
            cs.conversion_channel,
            cs.order_number
-    from fact_tables.conversions as cs
-    RIGHT JOIN dimensions.customer_dimension as cd -- this is to ensure we keep all customers even if they have no conversions 
+    FROM fact_tables.conversions AS cs
+    RIGHT JOIN dimensions.customer_dimension AS cd -- this is to ensure we keep all customers even if they have no conversions
         ON cs.fk_customer = cd.sk_customer
     LEFT JOIN dimensions.date_dimension AS dd
         ON cs.fk_conversion_date = dd.sk_date
     ),
 
--- CTE 2: first ever order placed *per conversion*
-first_orders AS (
+-- CTE 2: Order placed per conversion and week
+conversion_orders AS (
     SELECT cb.conversion_id,
+           -- Confirmed no need to aggregate by conversion_id i.e. 1 conversion to 1 order to 1 product
            cb.order_number,
--- confirmed no need to aggregate by conversion_id i.e. 1 conversion to 1 order to 1 product
-            dd.year_week AS first_order_week,
-            o.price_paid AS first_order_total_paid
+           dd.year_week AS order_week,
+           o.price_paid AS order_total_paid
     FROM conversion_base AS cb
           INNER JOIN fact_tables.orders AS o
                      ON cb.order_number = o.order_number
@@ -119,7 +163,7 @@ weekly_spine AS (
      FROM conversion_base AS cb
               LEFT JOIN (SELECT DISTINCT year_week FROM dimensions.date_dimension) AS dd
                         ON dd.year_week >= cb.conversion_week
-     WHERE (dd.year_week < cb.next_conversion_week OR cb.next_conversion_week IS NULL)
+                        AND dd.year_week < COALESCE(cb.next_conversion_week,TO_CHAR(CURRENT_DATE, 'IYYY-"W"IW'))
      ),
 
 -- Final CTE 5: Combine everything and compute running totals
@@ -129,14 +173,14 @@ final_table AS (
         ws.first_name,
         ws.last_name,
         ws.conversion_id,
-        ws.conversion_numer,
+        ws.conversion_number,
         ws.conversion_type,
         ws.conversion_date,
         ws.conversion_week,
         next_conversion_week,
         ws.conversion_channel,
-        fo.first_order_week,
-        fo.first_order_total_paid,
+        co.order_week AS first_order_week,
+        co.order_total_paid AS first_order_total_paid,
         ws.week_counter,
         ws.order_week,
         CASE WHEN awo.orders_count > 0 THEN 1 ELSE 0 END AS orders_placed,
@@ -144,20 +188,13 @@ final_table AS (
         CASE WHEN awo.total_discounts IS NULL THEN 0 ELSE awo.total_discounts END AS total_discounts,
         CASE WHEN awo.total_paid_in_week IS NULL THEN 0 ELSE awo.total_paid_in_week END AS total_paid_in_week,
 
-    -- Cumulative fields calculated using window functions over the generated spine
-        SUM(awo.total_paid_in_week) OVER(
-            PARTITION BY ws.conversion_id
-            ORDER BY ws.order_week
-            ) AS conversion_cumulative_revenue,
-
-        SUM(awo.total_paid_in_week) OVER (
-            PARTITION BY ws.customer_id
-            ORDER BY WS.order_week
-            ) AS lifetime_cumulative_revenue
+        -- Cumulative fields calculated using window functions over the generated spine
+        SUM(CASE WHEN awo.total_paid_in_week IS NULL THEN 0 ELSE awo.total_paid_in_week END) OVER (PARTITION BY ws.conversion_id ORDER BY ws.order_week) AS conversion_cumulative_revenue,
+        SUM(CASE WHEN awo.total_paid_in_week IS NULL THEN 0 ELSE awo.total_paid_in_week END) OVER (PARTITION BY ws.customer_id ORDER BY WS.order_week) AS lifetime_cumulative_revenue
 
     FROM weekly_spine AS ws
-    LEFT JOIN first_orders AS fo
-        ON ws.conversion_id = fo.conversion_id
+    LEFT JOIN conversion_orders AS co
+        ON ws.conversion_id = co.conversion_id
     LEFT JOIN aggregated_weekly_order AS awo
         ON ws.customer_id = awo.customer_id AND ws.order_week = awo.order_week
         -- WHERE ws.customer_id = 333
@@ -165,18 +202,3 @@ final_table AS (
     )
 INSERT INTO customer360.full_360_view
 SELECT * FROM final_table;
-
-
-SELECT
-    customer_id,
-    COUNT(*) AS row_count,
-    MAX(lifetime_cumulative_revenue) AS lifetime_cumulative_revenue
-FROM customer360.full_360_view
-GROUP BY customer_id
-ORDER BY customer_id;
-
-
-
-
-
-
